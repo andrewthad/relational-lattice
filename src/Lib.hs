@@ -21,16 +21,77 @@ import Data.Typeable (Typeable)
 import Data.Functor.Compose (Compose(..))
 import Data.Functor.Classes
 import Data.Monoid
+import Data.Map (Map)
+import Data.Bifunctor
+import qualified Data.Map as Map
 import qualified Data.HashSet as HashSet
 import qualified Data.List as List
 import qualified Data.Set as Set
 import qualified Text.PrettyPrint.Annotated as P
+import Debug.Trace
+
+-- data Exp = ExpInt Int | ExpNeg Exp | ExpAdd Exp Exp
+--
+-- Broken distributive law:
+--
+--   A >< (B X C) = (A >< B) X (B X C)
+--   if
+--   cols(A) intersect cols(B) = cols(A) intersect cols(C)
+--
 
 data Exp a = ExpInt Int | ExpNeg a | ExpAdd a a
   deriving (Functor,Show)
 
+newtype Fix f = Fix { unFix :: f (Fix f) }
+
+deriving instance Monoid (f (Fix f)) => Monoid (Fix f)
+
+-- f (f (f ...))
+
 cata :: Functor f => (f a -> a) -> Fix f -> a
 cata f = f . fmap (cata f) . unFix
+
+evaluator :: Exp Int -> Int
+evaluator x = case x of
+  ExpInt i -> i
+  ExpNeg i -> negate i
+  ExpAdd a b -> a + b
+
+preAdd :: Exp (Fix Exp) -> Fix Exp
+preAdd x = case x of
+  ExpAdd (Fix (ExpInt a)) (Fix (ExpInt b)) -> Fix (ExpInt (a + b))
+  _ -> Fix x
+
+myExp2 :: Fix Exp
+myExp2 = Fix $ ExpAdd
+  (Fix $ ExpNeg $ Fix $ ExpInt 55)
+  (Fix $ ExpAdd
+    (Fix $ ExpInt 37)
+    (Fix $ ExpInt 20)
+  )
+
+myExp :: Fix Exp
+myExp = Fix $ ExpNeg $ Fix $ ExpAdd
+  (Fix $ ExpInt 6)
+  (Fix $ ExpNeg $ Fix $ ExpInt 4)
+
+data Free f a = Free (f (Free f a)) | Pure a
+
+data Applied f a = Applied (f a)
+
+instance (Eq1 f, Eq a) => Eq (Applied f a) where
+  Applied a == Applied b = liftEq (==) a b
+
+instance (Eq1 f, Eq a) => Eq (Free f a) where (==) = eq1
+
+instance Eq1 f => Eq1 (Free f) where
+  liftEq e (Pure a) (Pure b) = e a b
+  liftEq e (Free f) (Free g) = liftEq (liftEq e) f g
+  liftEq _ _ _ = False
+
+
+
+-- data Cofree f a = Cofree (a, f (Cofree f a))
 
 data Ctx = Pos | Neg
 
@@ -41,11 +102,6 @@ invertCtx x = case x of
 
 newtype FromTo a b = FromTo { apFromTo :: a -> b }
   deriving (Functor)
-
-myExp :: Fix Exp
-myExp = Fix $ ExpNeg $ Fix $ ExpAdd
-  (Fix $ ExpInt 6)
-  (Fix $ ExpNeg $ Fix $ ExpInt 4)
 
 topDownNegationSimplify :: Fix Exp -> Fix Exp
 topDownNegationSimplify = flip apFromTo Pos . simp
@@ -79,12 +135,12 @@ data Value = ValueInt Int | ValueString String
 
 instance Hashable Value
 
-data Atom = AtomInt | AtomString
+prettyValue :: Value -> String
+prettyValue (ValueInt i) = show i
+prettyValue (ValueString s) = s
 
 newtype Column = Column { getColumn :: String }
   deriving (Eq,Ord,Show,Hashable)
-
-newtype Fix f = Fix { unFix :: f (Fix f) }
 
 deriving instance (Show (f (Fix f))) => Show (Fix f)
 deriving instance (Eq (f (Fix f))) => Eq (Fix f)
@@ -92,6 +148,10 @@ deriving instance (Ord (f (Fix f))) => Ord (Fix f)
 
 instance Hashable1 f => Hashable (Fix f) where
   hashWithSalt = let go s (Fix f) = liftHashWithSalt go s f in go
+
+data CorrectTable
+  = CorrectTableTable Table
+  | CorrectTableZeroOne
 
 newtype Table = Table { getTable :: [(Column,[Value])] }
   deriving (Show,Eq,Hashable,Ord)
@@ -101,6 +161,8 @@ instance Hashable a => Hashable (Set a) where
 
 data Base
   = BaseTable String Table
+  | BaseColumnEquality Column Column -- ^ If materialized, would be infinite
+  | BaseSingleton Column Value -- not really needed
   | BaseHeaders (Set Column)
   | BaseZeroOne
   deriving (Eq,Show,Generic,Ord)
@@ -177,7 +239,7 @@ data Annotation = Annotation
 -- Identities involving zeroes:
 -- H00 & A = H(A)
 -- H01 & A = A
--- H0X & A = H(A) -- headers without body
+-- H0X & A = H(A union X) -- headers without body
 --
 -- These ones are sort of worthless:
 -- H0X | A = H0X- | A -- projection, we can reduce the headers in H0X
@@ -254,6 +316,10 @@ naturalJoinLeftIdentities :: Fix (With (Set Column) Relation) -> Fix (With (Set 
 naturalJoinLeftIdentities a@(Fix (With colsA relA)) b@(Fix (With colsB relB)) = case relA of
   RelationBinary _ _ -> Nothing
   RelationBase base -> case base of
+    -- think about this more, there's probably something that make it
+    -- go away.
+    BaseColumnEquality _ _ -> Nothing
+    BaseSingleton _ _ -> Nothing
     BaseZeroOne -> Just b
     BaseHeaders _colsA ->
       let newCols = Set.union colsA colsB
@@ -284,25 +350,30 @@ annotateRelationX x = error "write me"
   --   NaturalJoin -> Fix (With (Annotation $ Set.union colsA colsB) x)
   --   InnerUnion -> Fix (With (Annotation $ Set.intersection colsA colsB) x)
 
-determineHeaders :: Fix Relation -> Fix (With (Set Column) Relation)
+toHeaders :: (Functor f, Foldable f) => Fix (RelationF f) -> Set Column
+toHeaders = withFirst . unFix . determineHeaders
+
+determineHeaders :: (Functor f, Foldable f) => Fix (RelationF f) -> Fix (With (Set Column) (RelationF f))
 determineHeaders = liftAnnotate determineHeadersX
 
 determineHash :: Int -> Fix Relation -> Fix (With Int Relation)
 determineHash s = liftAnnotate (determineHashX s)
 
-determineHeadersX :: Relation (Set Column) -> Set Column
+determineHeadersX :: Foldable f => RelationF f (Set Column) -> Set Column
 determineHeadersX x = case x of
   RelationBase base -> case base of
     BaseZeroOne -> Set.empty
     BaseHeaders cols -> cols
     BaseTable _ t -> Set.fromList $ columns t
-  RelationBinary op (Pair colsA colsB) -> case op of
-    NaturalJoin -> Set.union colsA colsB
-    InnerUnion -> Set.intersection colsA colsB
+  RelationBinary op cols -> case op of -- (Pair colsA colsB)
+    NaturalJoin -> Set.unions (toList cols)
+    InnerUnion -> foldr Set.intersection Set.empty cols
 
 determineHashX :: Int -> Relation Int -> Int
 determineHashX s x = case x of
   RelationBase base -> case base of
+    BaseColumnEquality a b -> s `hashWithSalt` a `hashWithSalt` b
+    BaseSingleton a b -> s `hashWithSalt` a `hashWithSalt` b
     BaseZeroOne -> s `hashWithSalt` (0 :: Int)
     BaseHeaders cols -> s `hashWithSalt` (1 :: Int) `hashFoldableWithSalt` cols
     BaseTable name t -> s `hashWithSalt` (2 :: Int) `hashWithSalt` name `hashWithSalt` t
@@ -375,9 +446,32 @@ petRelation = Table
   , (Column "dog_name", map ValueString ["Fluff","Scruff","Spike","Scar","Mane"])
   ]
 
-project :: [String] -> Fix Relation -> Fix Relation
+prefix :: String -> Fix Relation -> Fix Relation
+prefix pre original =
+  let pairs = map
+        (\(Column c) -> (Column c,Column $ pre ++ "." ++ c))
+        $ toList $ toHeaders original
+      newColumns = map snd pairs
+   in project newColumns $ foldr (\(old,new) r -> extend old new r) original pairs
+
+-- rename ::
+--      Column -- old column, should already exist in relation
+--   -> Column -- new column, should not already exist
+--   -> Fix Relation
+--   -> Fix Relation
+-- rename
+
+extend ::
+     Column -- old column, should already exist in relation
+  -> Column -- new column, should not already exist
+  -> Fix Relation
+  -> Fix Relation
+extend old new r = Fix $ RelationBinary NaturalJoin
+  (Pair r (Fix $ RelationBase (BaseColumnEquality old new)))
+
+project :: [Column] -> Fix Relation -> Fix Relation
 project cols r = Fix $ RelationBinary InnerUnion $ Pair r
-  (Fix $ RelationBase $ BaseHeaders (Set.fromList (map Column cols)))
+  (Fix $ RelationBase $ BaseHeaders (Set.fromList cols))
 
 h00 :: Fix Relation
 h00 = Fix $ RelationBase $ BaseHeaders Set.empty
@@ -393,6 +487,162 @@ optimizeRelation = id
   . dropAnnotations . applyIdempotenceIdentities
   . dropAnnotations . applyZeroIdentities . determineHeaders
 
+planRelation :: Fix Relation -> Fix PlanAtom
+planRelation = forcePlan . cata atomizeRelationF . optimizeRelation
+
+data IndexedColumn = IndexedColumn Int Column
+  deriving (Eq,Ord,Show)
+
+data PlanAtom a = PlanAtom
+  { planAtomVisible :: Map Column IndexedColumn
+  , planAtomEqualities :: [(IndexedColumn,IndexedColumn)]
+  , planAtomRestrictions :: [(IndexedColumn,Value)]
+  , planAtomChildren :: Map Int (Either (String,Table) (a,a))
+    -- ^ Either a table or two plans that need to be
+    --   unioned.
+  } deriving (Functor,Show,Eq,Ord)
+
+data IndeterminatePlan
+  = IndeterminatePlanRows (Fix PlanAtom) (Map Column Value) [(Column,Column)]
+    -- ^ Has restrictions and columnar equalities that cannot yet
+    --   be applied.
+  | IndeterminatePlanHeaders (Set Column)
+
+data TempPlan
+  = TempPlanAtom (Fix PlanAtom)
+  | TempPlanHeaders (Set Column)
+  | TempPlanSingEquality (Map Column Value) [(Column,Column)]
+
+addIndexedColumn :: Int -> IndexedColumn -> IndexedColumn
+addIndexedColumn i (IndexedColumn a b) = IndexedColumn (i + a) b
+
+addPlanIndex :: Int -> PlanAtom a -> PlanAtom a
+addPlanIndex i (PlanAtom vis equality restr ch) = PlanAtom
+  (fmap (addIndexedColumn i) vis)
+  (map (bimap (addIndexedColumn i) (addIndexedColumn i)) equality)
+  (map (first (addIndexedColumn i)) restr)
+  (Map.mapKeysMonotonic (+i) ch)
+
+highestIndex :: PlanAtom a -> Int
+highestIndex p =
+  case Set.maxView (Map.keysSet (planAtomChildren p)) of
+    Nothing -> 0
+    Just (a,_) -> a
+
+-- | natural join is mappend. H01 is mempty
+instance Monoid (PlanAtom a) where
+  mempty = PlanAtom Map.empty [] [] Map.empty
+  mappend p1@(PlanAtom vis1 equal1 restr1 ch1) p2 =
+    let (PlanAtom vis2 equal2 restr2 ch2) = addPlanIndex (highestIndex p1) p2
+        newEqualities = Map.elems $ Map.intersectionWith (\c1 c2 -> (c1,c2)) vis1 vis2
+     in PlanAtom (Map.union vis1 vis2)
+          (equal1 <> equal2 <> newEqualities)
+          (restr1 <> restr2)
+          (ch1 <> ch2)
+
+tablePlanAtom :: String -> Table -> PlanAtom a
+tablePlanAtom name t = PlanAtom
+  (Map.fromList $ map (\c -> (c,IndexedColumn 1 c)) $ columns t)
+  [] [] (Map.singleton 1 (Left (name,t)))
+
+forcePlan :: IndeterminatePlan -> Fix PlanAtom
+forcePlan (IndeterminatePlanRows p restr colEqs) = if Map.null restr && null colEqs
+  then p
+  else error $ "forcePlan: leftovers encountered. restrictions:" ++ show restr ++ ". Equalities: " ++ show colEqs
+
+atomizeRelationF :: RelationF [] IndeterminatePlan -> IndeterminatePlan
+atomizeRelationF x = case x of
+  RelationBase base -> case base of
+    BaseTable name t -> IndeterminatePlanRows (Fix $ tablePlanAtom name t) Map.empty []
+    BaseZeroOne -> error "atomizeRelationF: write BaseZeroOne"
+    BaseHeaders cols -> IndeterminatePlanHeaders cols
+    BaseSingleton col val -> IndeterminatePlanRows mempty (Map.singleton col val) []
+    BaseColumnEquality colA colB -> IndeterminatePlanRows mempty Map.empty [(colA,colB)]
+  RelationBinary op rels -> case op of
+    NaturalJoin -> foldr naturalJoinIndeterminatePlan (IndeterminatePlanRows mempty mempty mempty) rels
+    InnerUnion -> foldr1 innerUnionIndeterminatePlan rels -- kind of dangerous
+
+innerUnionIndeterminatePlan :: IndeterminatePlan -> IndeterminatePlan -> IndeterminatePlan
+innerUnionIndeterminatePlan = go where
+  go (IndeterminatePlanHeaders as) (IndeterminatePlanHeaders bs) =
+    IndeterminatePlanHeaders (Set.intersection as bs)
+  go (IndeterminatePlanHeaders as) (IndeterminatePlanRows plan restr colEqs) =
+    handleProj as plan restr colEqs
+  go (IndeterminatePlanRows plan restr colEqs) (IndeterminatePlanHeaders as) =
+    handleProj as plan restr colEqs
+  go (IndeterminatePlanRows plan1 restr1 colEqs1) (IndeterminatePlanRows plan2 restr2 colEqs2) =
+    if Map.null restr1 && Map.null restr2 && null colEqs1 && null colEqs2
+      then
+        let theCols = Set.intersection
+              (Map.keysSet (planAtomVisible $ unFix plan1))
+              (Map.keysSet (planAtomVisible $ unFix plan2))
+         in IndeterminatePlanRows
+              ( Fix $ PlanAtom (Map.fromSet (\c -> (IndexedColumn 1 c)) theCols) [] []
+                  (Map.singleton 1 (Right (plan1,plan2)))
+              ) Map.empty []
+      else error "innerUnionIndeterminatePlan: cannot handle this situation"
+  handleProj as (Fix plan) restr colEqs =
+    if all (\(c1,c2) -> Set.member c1 as || Set.member c2 as) colEqs
+      then IndeterminatePlanRows (Fix plan { planAtomVisible = Map.restrictKeys (planAtomVisible plan) as })
+             (Map.restrictKeys restr as) colEqs
+      else error "innerUnionIndeterminatePlan: projection over an infinite relation."
+
+naturalJoinIndeterminatePlan :: IndeterminatePlan -> IndeterminatePlan -> IndeterminatePlan
+naturalJoinIndeterminatePlan = go where
+  go (IndeterminatePlanHeaders as) (IndeterminatePlanHeaders bs) =
+    IndeterminatePlanHeaders (Set.union as bs)
+  go (IndeterminatePlanHeaders as) (IndeterminatePlanRows plan restr colEqs) =
+    handleProj as plan restr colEqs
+  go (IndeterminatePlanRows plan restr colEqs) (IndeterminatePlanHeaders as) =
+    handleProj as plan restr colEqs
+  go (IndeterminatePlanRows plan1 restr1 colEqs1) (IndeterminatePlanRows plan2 restr2 colEqs2) =
+    let (colEqs1',plan2') = applyEqualities colEqs1 plan2
+        (colEqs2',plan1') = applyEqualities colEqs2 plan1
+        (restr1',plan2'') = applyRestrictions restr1 plan2'
+        (restr2',plan1'') = applyRestrictions restr2 plan1'
+     in IndeterminatePlanRows
+          (plan1'' <> plan2'')
+          (restr1' <> restr2') -- this is totally wrong. we should check to see if
+                               -- overlaps match. If not, the result is H00.
+          (colEqs1' <> colEqs2')
+  handleProj as (Fix plan) restr colEqs = error "dont join headers with plan"
+
+applyRestrictions :: Map Column Value -> Fix PlanAtom -> (Map Column Value, Fix PlanAtom)
+applyRestrictions m (Fix p) =
+  let matched = Map.intersectionWith (\v i -> (i,v)) m (planAtomVisible p)
+   in (Map.difference m matched, Fix p {planAtomRestrictions = planAtomRestrictions p ++ Map.elems matched})
+
+applyEqualities :: [(Column,Column)] -> Fix PlanAtom -> ([(Column,Column)], Fix PlanAtom)
+applyEqualities cs (Fix p) =
+  let vis = planAtomVisible p
+      -- ematches = map (\pair@(a,b) -> maybe (Left pair) Right $ (,) <$> Map.lookup a vis <*> Map.lookup b vis) cs
+      ematches = map (\pair@(a,b) -> case (Map.lookup a vis, Map.lookup b vis) of
+          (Nothing,Nothing) -> Left pair
+          (Just c,Nothing) -> Right $ Left $ Map.singleton b c
+          (Nothing,Just c) -> Right $ Left $ Map.singleton a c
+          (Just c1,Just c2) -> Right $ Right (c1,c2)
+        ) cs
+      unhandledEqualities = lefts ematches
+      xs = rights ematches
+      aliases = lefts xs
+      equalities = rights xs
+   in ( unhandledEqualities
+      , Fix p { planAtomEqualities = planAtomEqualities p ++ equalities
+              , planAtomVisible = Map.union (planAtomVisible p) (Map.unions aliases)
+              }
+      )
+
+lefts :: [Either a b] -> [a]
+lefts [] = []
+lefts (Right _ : xs) = lefts xs
+lefts (Left a : xs) = a : lefts xs
+
+rights :: [Either a b] -> [b]
+rights [] = []
+rights (Left _ : xs) = rights xs
+rights (Right b : xs) = b : rights xs
+
+
 mySalt :: Int
 mySalt = 24623463
 
@@ -400,6 +650,8 @@ runRelationX :: Relation Table -> Table
 runRelationX x = case x of
   RelationBase b -> case b of
     BaseTable _ t -> t
+    -- BaseSingleton c v -> Table [(c,[v])]
+    BaseColumnEquality c1 c2 -> error "runRelationX: cannot materialize BaseColumnEquality"
     BaseZeroOne -> Table [] -- this is not currently correctly representable by Table
     BaseHeaders cols -> Table $ map (\c -> (c,[])) $ Set.toList cols
   RelationBinary b (Pair n m) -> case b of
@@ -419,10 +671,30 @@ prettyPrintRelationX :: Foldable f => RelationF f (P.Doc a) -> P.Doc a
 prettyPrintRelationX x = case x of
   RelationBase b -> case b of
     BaseTable name _ -> P.text name
+    BaseColumnEquality (Column old) (Column new) -> P.text $ "virtual: " ++ old ++ " = " ++ new
+    BaseSingleton col val -> P.text $
+      "singleton: " ++ getColumn col ++ " = " ++ prettyValue val
     BaseHeaders cols -> P.text $ ("headers: " ++) $ List.intercalate ", " $ map getColumn $ Set.toList cols
     BaseZeroOne -> P.text "H01"
   RelationBinary op xs ->
     (P.$$) (P.text $ opToString op) (P.nest 2 $ P.vcat $ toList xs) -- (P.nest 2 (a P.$$ b))
+
+prettyPrintPlanX :: PlanAtom (P.Doc a) -> P.Doc a
+prettyPrintPlanX (PlanAtom vis equalities restr children) = P.vcat
+  [ P.text "Visible: " <> P.vcat (map (\(Column alias,IndexedColumn i (Column original)) -> P.text $ alias ++ " -> " ++ show i ++ "." ++ original) $ Map.toList vis)
+  , P.text "Equalities: " <> P.vcat (map (\(IndexedColumn i1 (Column c1),IndexedColumn i2 (Column c2)) -> P.text $ show i1 ++ "." ++ c1 ++ " = " ++ show i2 ++ "." ++ c2) equalities)
+  , P.text "Restrictions: " <> P.vcat (map (\(IndexedColumn i1 (Column c1),v) -> P.text $ show i1 ++ "." ++ c1 ++ " = " ++ prettyValue v) restr)
+  , P.text "Relations: " <> P.vcat (map (\(ix,e) -> case e of
+      Left (name,table) -> P.text ("Table " ++ show ix) P.$$ P.nest 2 (P.text name P.$$ prettyTable table)
+      Right (ch1,ch2) -> error "subexpr: write me"
+    ) (Map.toList children))
+  ]
+
+prettyTable :: Table -> P.Doc a
+prettyTable (Table xs) = P.text "Columns: " P.$$ P.nest 2 (P.vcat (map (P.text . getColumn . fst) xs))
+
+prettyPrintPlan :: Fix PlanAtom -> P.Doc a
+prettyPrintPlan = cata prettyPrintPlanX
 
 opToString :: BinaryOperation -> String
 opToString x = case x of
@@ -438,10 +710,32 @@ pet = table "pet" petRelation
 employment = table "employment" employmentRelation
 company = table "company" companyRelation
 
+selection :: Column -> Value -> Fix Relation -> Fix Relation
+selection col v r = id
+  $ Fix $ RelationBinary NaturalJoin $ Pair r
+  $ Fix $ RelationBase $ BaseSingleton col v
+
 petsAtCompany :: Fix Relation
-petsAtCompany =
+petsAtCompany = id
+  -- $ naturalJoin (project [Column "company_name"] company)
   -- innerUnion pet $ naturalJoin pet $ naturalJoin person $ naturalJoin company $ naturalJoin h00 employment
-  innerUnion pet $ naturalJoin pet $ naturalJoin person $ naturalJoin company $ naturalJoin employment employment
+  $ naturalJoin pet
+  $ naturalJoin employment
+  $ naturalJoin person
+  $ company
+  -- $ naturalJoin employment employment
+
+example :: Fix Relation
+example = id
+  $ selection (Column "pet_a.dog_name") (ValueString "Scruff")
+  $ extend (Column "person_a.person_id")
+           (Column "pet_a.person_id")
+  $ naturalJoin (prefix "person_a" person)
+  $ prefix "pet_a" pet
+
+exampleEasy :: Fix Relation
+exampleEasy = id
+  $ prefix "thing" pet
 
 petsDoubled :: Fix Relation
 petsDoubled =
